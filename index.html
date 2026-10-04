@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NATS Message Console</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #fff; }
+    main { max-width: 760px; margin: 0 auto; }
+    * { box-sizing: border-box; }
+    #status { font-weight: bold; padding: 8px; margin-bottom: 12px; border-radius: 4px; }
+    .connected { background: #1b5e20; }
+    .disconnected { background: #b71c1c; }
+    form { display: grid; gap: 10px; margin: 24px 0; }
+    input, textarea, button { font: inherit; font-size: 1rem; border-radius: 4px; }
+    input, textarea { width: 100%; padding: 12px; background: #2d2d2d; color: #fff; border: 1px solid #888; }
+    textarea { min-height: 140px; resize: vertical; }
+    button { min-height: 48px; padding: 10px 18px; border: 0; background: #a6e3b1; color: #142719; cursor: pointer; justify-self: start; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    :focus-visible { outline: 2px solid #a6e3b1; outline-offset: 3px; }
+    #publish-result { min-height: 1.5em; margin: 0; overflow-wrap: anywhere; }
+    ul { list-style: none; padding: 0; }
+    li { background: #2d2d2d; padding: 8px 12px; margin-bottom: 6px; border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #status { overflow-wrap: anywhere; }
+    .consumers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+    .consumer h2 { font-size: 1.1rem; }
+    @media (max-width: 560px) { .consumers { grid-template-columns: 1fr; } }
+    @media (max-width: 480px) { body { padding: 12px; } button { width: 100%; } }
+  </style>
+</head>
+<body>
+  <main>
+  <h1>NATS Message Console</h1>
+  <div id="status" class="disconnected" role="status">Status: Connecting...</div>
+
+  <form id="publish-form">
+    <label for="subject">Subject (required)</label>
+    <input id="subject" name="subject" value="demo.test" required autocomplete="off" spellcheck="false" />
+    <label for="message">Message (required)</label>
+    <textarea id="message" name="message" required placeholder="Enter a message" aria-describedby="publish-result"></textarea>
+    <button id="publish-button" type="submit" disabled>Publish message</button>
+    <p id="publish-result" role="status"></p>
+  </form>
+
+  <div class="consumers" aria-label="NATS consumers">
+    <section class="consumer" aria-labelledby="consumer-1-title">
+      <h2 id="consumer-1-title">Consumer 1 (<code>demo.test</code>)</h2>
+      <ul id="consumer-1-messages" aria-live="polite"></ul>
+    </section>
+    <section class="consumer" aria-labelledby="consumer-2-title">
+      <h2 id="consumer-2-title">Consumer 2 (<code>demo.test</code>)</h2>
+      <ul id="consumer-2-messages" aria-live="polite"></ul>
+    </section>
+  </div>
+  </main>
+
+  <script type="module">
+    const statusEl = document.getElementById("status");
+    const consumerLists = [
+      document.getElementById("consumer-1-messages"),
+      document.getElementById("consumer-2-messages"),
+    ];
+    const form = document.getElementById("publish-form");
+    const subjectEl = document.getElementById("subject");
+    const messageEl = document.getElementById("message");
+    const publishButton = document.getElementById("publish-button");
+    const resultEl = document.getElementById("publish-result");
+    let nc;
+    let sc;
+    let publishing = false;
+    let connected = false;
+
+    subjectEl.addEventListener("input", () => subjectEl.setCustomValidity(""));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const subject = subjectEl.value.trim();
+      if (!/^[^\s.*>]+(?:\.[^\s.*>]+)*$/u.test(subject)) {
+        subjectEl.setCustomValidity("Enter a subject with nonempty dot-separated names, without spaces or wildcards.");
+        subjectEl.reportValidity();
+        return;
+      }
+      if (publishing || !nc || nc.isClosed() || !connected) {
+        resultEl.textContent = "Wait for a connection before publishing.";
+        return;
+      }
+      publishing = true;
+      publishButton.disabled = true;
+      resultEl.textContent = "Publishing...";
+      try {
+        nc.publish(subject, sc.encode(messageEl.value));
+        await nc.flush();
+        resultEl.textContent = `Published to '${subject}' at ${new Date().toLocaleTimeString()}.`;
+      } catch (err) {
+        resultEl.textContent = `Publish failed: ${err.message}`;
+      } finally {
+        publishing = false;
+        publishButton.disabled = !connected || nc.isClosed();
+      }
+    });
+
+    async function monitorConnection() {
+      for await (const event of nc.status()) {
+        if (event.type === "disconnect" || event.type === "reconnecting") {
+          connected = false;
+          statusEl.textContent = "Status: Reconnecting...";
+          statusEl.className = "disconnected";
+          publishButton.disabled = true;
+        } else if (event.type === "reconnect") {
+          connected = true;
+          statusEl.textContent = `Status: Connected to ${nc.getServer()}`;
+          statusEl.className = "connected";
+          publishButton.disabled = publishing;
+        }
+      }
+    }
+
+    async function init() {
+      try {
+        const { connect, StringCodec } = await import("https://esm.sh/nats.ws@1.30.3");
+        sc = StringCodec();
+        nc = await connect({ servers: "ws://localhost:8080", timeout: 3000 });
+
+        statusEl.textContent = `Status: Connected to ${nc.getServer()}`;
+        statusEl.className = "connected";
+        connected = true;
+        publishButton.disabled = false;
+        monitorConnection().catch((err) => {
+          resultEl.textContent = `Connection status error: ${err.message}`;
+        });
+        nc.closed().then((err) => {
+          connected = false;
+          statusEl.textContent = err ? `Status: Connection Error (${err.message})` : "Status: Disconnected";
+          statusEl.className = "disconnected";
+          publishButton.disabled = true;
+        });
+
+        const subscriptions = consumerLists.map(() => nc.subscribe("demo.test"));
+        await nc.flush();
+
+        await Promise.all(subscriptions.map(async (sub, index) => {
+          const listEl = consumerLists[index];
+          for await (const msg of sub) {
+            const li = document.createElement("li");
+            li.textContent = `[${msg.subject}] ${sc.decode(msg.data)}`;
+            listEl.prepend(li);
+            if (listEl.children.length > 100) listEl.lastElementChild.remove();
+          }
+        }));
+      } catch (err) {
+        connected = false;
+        statusEl.textContent = `Status: Connection Error (${err.message})`;
+        statusEl.className = "disconnected";
+        publishButton.disabled = true;
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
